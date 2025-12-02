@@ -1,0 +1,841 @@
+import torch
+import torch.nn as nn
+from torch.autograd import grad
+import numpy as np
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+from datetime import datetime
+import warnings
+import gc
+
+warnings.filterwarnings('ignore', category=UserWarning)
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
+
+
+# ==================== GPU优化配置 ====================
+def setup_gpu():
+    """设置GPU环境"""
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"使用GPU: {torch.cuda.get_device_name()}")
+        print(f"显存: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.1f} GB")
+        # 清理显存
+        torch.cuda.empty_cache()
+        # 优化GPU设置
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+    else:
+        device = torch.device("cpu")
+        print("未找到GPU，使用CPU")
+    return device
+
+
+# ==================== 配置部分 ====================
+data_dir = Path(r"C:\Users\Administrator\Desktop")
+train_path = data_dir / "训练集.xlsx"
+val_path = data_dir / "验证集.xlsx"
+test_path = data_dir / "测试集.xlsx"  # 新增测试集路径
+output_dir = data_dir / "output"
+output_dir.mkdir(exist_ok=True)
+
+# 物理参数配置
+physics_config = {
+    'rho_s': 2130.0, 'c_pc': 1980.0, 'beta': 8.5e-6,
+    'T0': 293.15, 'nu': 0.4,
+    'well_positions': [(4.0, 3.0), (4.0, 9.0)],
+    'Q_max': 3.79e3, 'Q_min': 1.76e-4, 'r_max': 5.0,
+    'symmetry_axis': 6.0, 'domain_width': 12.0
+}
+
+
+# ==================== 数据加载函数 ====================
+def load_and_normalize_data(path):
+    """加载并标准化数据 - 改进的标准化策略"""
+    try:
+        df = pd.read_excel(path)
+        required_cols = ['x', 'y', 't', 'u', 'v', 'T']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+
+        X = df[['x', 'y', 't']].values.astype(np.float32)
+        y = df[['u', 'v', 'T']].values.astype(np.float32)
+
+        # 改进的标准化 - 使用更稳定的归一化
+        X_mean, X_std = X.mean(axis=0), X.std(axis=0)
+        X_std = np.where(X_std < 1e-8, 1.0, X_std)
+
+        # 使用更平滑的归一化
+        y_mean, y_std = y.mean(axis=0), y.std(axis=0)
+        y_std = np.where(y_std < 1e-8, 1.0, y_std)
+
+        X_norm = (X - X_mean) / X_std
+        y_norm = (y - y_mean) / y_std
+
+        return (torch.from_numpy(X_norm),
+                torch.from_numpy(y_norm),
+                (X_mean, X_std, y_mean, y_std))
+    except Exception as e:
+        print(f"Error loading data: {str(e)}")
+        return None, None, None
+
+
+def load_test_data(path, train_stats):
+    """加载测试数据并使用训练集统计量进行归一化"""
+    try:
+        df = pd.read_excel(path)
+        required_cols = ['x', 'y', 't', 'u', 'v', 'T']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns in test data: {missing_cols}")
+
+        X_test = df[['x', 'y', 't']].values.astype(np.float32)
+        y_test = df[['u', 'v', 'T']].values.astype(np.float32)
+
+        # 使用训练集的统计量进行归一化
+        X_mean, X_std, y_mean, y_std = train_stats
+
+        X_test_norm = (X_test - X_mean) / X_std
+        y_test_norm = (y_test - y_mean) / y_std
+
+        return (torch.from_numpy(X_test_norm),
+                torch.from_numpy(y_test_norm))
+    except Exception as e:
+        print(f"Error loading test data: {str(e)}")
+        return None, None
+
+
+def denormalize_predictions(pred_norm, train_stats):
+    """反标准化预测结果"""
+    _, _, y_mean, y_std = train_stats
+    return pred_norm * y_std + y_mean
+
+
+# ==================== 稳定训练的模型定义 ====================
+class StablePhysicsInformedNN(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+
+        # 网络结构 - 更稳定的设计
+        self.input_layer = nn.Sequential(
+            nn.Linear(3, 512),
+            nn.LayerNorm(512),  # 添加层归一化提高稳定性
+            nn.Tanh()
+        )
+
+        # 减少网络深度，增加稳定性
+        self.hidden_layers = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(512, 512),
+                nn.LayerNorm(512),
+                nn.Tanh(),
+                nn.Dropout(0.05)  # 减少dropout率
+            ) for _ in range(4)  # 减少到4层
+        ])
+
+        # 分支输出层
+        self.u_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+            nn.Linear(256, 1)
+        )
+        self.v_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+            nn.Linear(256, 1)
+        )
+        self.T_head = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.Tanh(),
+            nn.Linear(256, 1)
+        )
+
+        # λ参数 - 修改范围到0.5-0.6
+        self.log_lambda = nn.Parameter(torch.log(torch.tensor(0.55)))
+
+        # 稳定性改进的归一化参数
+        self.register_buffer('thermo_norm', torch.tensor(1e4, dtype=torch.float32))
+        self.register_buffer('mech_norm', torch.tensor(1e6, dtype=torch.float32))
+
+        # 添加损失平滑器
+        self.register_buffer('loss_ema', torch.tensor(1.0, dtype=torch.float32))
+        self.register_buffer('loss_history', torch.zeros(50, dtype=torch.float32))
+        self.register_buffer('history_idx', torch.tensor(0, dtype=torch.long))
+
+        self._initialize_weights()
+        self.to(device)
+
+    def _initialize_weights(self):
+        """保守的权重初始化"""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # 使用更小的初始化方差
+                nn.init.xavier_normal_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """前向传播 - 更稳定的残差连接"""
+        features = self.input_layer(x)
+
+        # 加权残差连接
+        for i, layer in enumerate(self.hidden_layers):
+            residual = features
+            features = layer(features)
+            # 使用较小的残差权重增加稳定性
+            features = 0.8 * features + 0.2 * residual
+
+        # 分支输出
+        u = self.u_head(features)
+        v = self.v_head(features)
+        T = self.T_head(features)
+
+        return torch.cat([u, v, T], dim=1)
+
+    def heat_conductivity(self, T):
+        """热导率 - 更稳定的约束"""
+        k = 1.872e-4 * (T - 273.15) - 6.674e-3
+        return torch.clamp(k, 1e-4, 1e1)
+
+    def elastic_modulus(self, T):
+        """弹性模量 - 更稳定的约束"""
+        E = (2.997 - 0.00303 * (T - 273.15)) * 1e9
+        return torch.clamp(E, 5e8, 5e9)
+
+    def lame_parameters(self, T):
+        """拉梅参数 - 数值稳定性改进"""
+        E = self.elastic_modulus(T)
+        nu = torch.tensor(physics_config['nu'], device=self.device)
+
+        denom1 = (1 + nu) * (1 - 2 * nu)
+        denom1 = torch.clamp(denom1, min=1e-8)
+
+        lambda_ = E * nu / denom1
+        mu = E / (2 * (1 + nu))
+
+        return lambda_, mu
+
+    def microwave_source(self, x, y):
+        """微波源项 - 优化计算"""
+        Q = torch.zeros_like(x)
+        Q_max = torch.tensor(physics_config['Q_max'], device=self.device)
+        Q_min = torch.tensor(physics_config['Q_min'], device=self.device)
+        r_max = torch.tensor(physics_config['r_max'], device=self.device)
+
+        for x0, y0 in physics_config['well_positions']:
+            x0_t = torch.tensor(x0, device=self.device)
+            y0_t = torch.tensor(y0, device=self.device)
+
+            r = torch.sqrt((x - x0_t) ** 2 + (y - y0_t) ** 2 + 1e-8)
+            Q += Q_min + (Q_max - Q_min) * torch.exp(-2 * r / r_max)
+
+            x_sym = 2 * physics_config['symmetry_axis'] - x0
+            x_sym_t = torch.tensor(x_sym, device=self.device)
+            r_sym = torch.sqrt((x - x_sym_t) ** 2 + (y - y0_t) ** 2 + 1e-8)
+            Q += Q_min + (Q_max - Q_min) * torch.exp(-2 * r_sym / r_max)
+
+        return Q * 0.5 / (Q_max + 1e-10)
+
+    def update_loss_history(self, total_loss):
+        """更新损失历史用于稳定性监控"""
+        with torch.no_grad():
+            self.loss_history[self.history_idx] = total_loss.detach()
+            self.history_idx = (self.history_idx + 1) % 50
+
+            # 更新EMA
+            self.loss_ema = 0.95 * self.loss_ema + 0.05 * total_loss.detach()
+
+    def get_loss_stability(self):
+        """计算损失稳定性指标"""
+        with torch.no_grad():
+            if self.history_idx == 0:
+                return 1.0  # 初始阶段
+
+            recent_losses = self.loss_history[:self.history_idx] if self.history_idx < 50 else self.loss_history
+            if len(recent_losses) < 10:
+                return 1.0
+
+            # 计算变异系数
+            mean_loss = recent_losses.mean()
+            std_loss = recent_losses.std()
+            cv = std_loss / (mean_loss + 1e-8)
+
+            return cv.item()
+
+    def compute_losses(self, inputs, targets=None, compute_physics=True):
+        """稳定的损失计算"""
+        losses = {}
+
+        # 1. 数据损失
+        if targets is not None:
+            pred = self(inputs)
+
+            losses['L_u_u'] = torch.mean((pred[:, 0] - targets[:, 0]) ** 2)
+            losses['L_u_v'] = torch.mean((pred[:, 1] - targets[:, 1]) ** 2)
+            losses['L_u_T'] = torch.mean((pred[:, 2] - targets[:, 2]) ** 2)
+
+            # 稍微调整权重比例
+            losses['L_u'] = (0.3 * losses['L_u_u'] +
+                             0.3 * losses['L_u_v'] +
+                             0.4 * losses['L_u_T'])
+
+        # 2. 物理损失
+        if compute_physics:
+            inputs.requires_grad_(True)
+            outputs = self(inputs)
+            u, v, T = outputs[:, 0:1], outputs[:, 1:2], outputs[:, 2:3]
+
+            # 梯度计算
+            grad_outputs = torch.ones_like(T)
+            T_grad = grad(T, inputs, grad_outputs=grad_outputs,
+                          create_graph=True, retain_graph=True)[0]
+            T_t, T_x, T_y = T_grad[:, 2:3], T_grad[:, 0:1], T_grad[:, 1:2]
+
+            u_grad = grad(u, inputs, grad_outputs=torch.ones_like(u),
+                          create_graph=True, retain_graph=True)[0]
+            v_grad = grad(v, inputs, grad_outputs=torch.ones_like(v),
+                          create_graph=True, retain_graph=True)[0]
+            u_x, v_y = u_grad[:, 0:1], v_grad[:, 1:2]
+
+            # 二阶导数
+            T_xx = grad(T_x, inputs, grad_outputs=torch.ones_like(T_x),
+                        create_graph=True, retain_graph=True)[0][:, 0:1]
+            T_yy = grad(T_y, inputs, grad_outputs=torch.ones_like(T_y),
+                        create_graph=True, retain_graph=True)[0][:, 1:2]
+
+            # 物理参数
+            k = self.heat_conductivity(T)
+            lambda_, mu = self.lame_parameters(T)
+            beta = physics_config['beta'] * (3 * lambda_ + 2 * mu)
+            Q_e = self.microwave_source(inputs[:, 0:1], inputs[:, 1:2]) * 30  # 减少源项强度
+
+            # 物理方程残差
+            heat_eq = (
+                    torch.tensor(physics_config['rho_s'], device=self.device) *
+                    torch.tensor(physics_config['c_pc'], device=self.device) * T_t -
+                    k * (T_xx + T_yy) -
+                    Q_e -
+                    beta * torch.tensor(physics_config['T0'], device=self.device) * (u_x + v_y)
+            )
+
+            div_strain = u_x + v_y
+            mech_eq_x = (lambda_ + mu) * grad(div_strain, inputs,
+                                              grad_outputs=torch.ones_like(div_strain),
+                                              create_graph=True)[0][:, 0:1]
+            mech_eq_y = (lambda_ + mu) * grad(div_strain, inputs,
+                                              grad_outputs=torch.ones_like(div_strain),
+                                              create_graph=True)[0][:, 1:2]
+
+            # 更保守的动态归一化
+            with torch.no_grad():
+                heat_scale = heat_eq.abs().mean() + 1e-8
+                mech_scale = (mech_eq_x.abs().mean() + mech_eq_y.abs().mean()) / 2 + 1e-8
+
+                # 更慢的更新速度增加稳定性
+                self.thermo_norm = 0.98 * self.thermo_norm + 0.02 * heat_scale * 500
+                self.mech_norm = 0.98 * self.mech_norm + 0.02 * mech_scale * 500
+
+            # 归一化残差
+            heat_eq_norm = heat_eq / torch.clamp(self.thermo_norm, min=1e-6)
+            mech_eq_x_norm = mech_eq_x / torch.clamp(self.mech_norm, min=1e-6)
+            mech_eq_y_norm = mech_eq_y / torch.clamp(self.mech_norm, min=1e-6)
+
+            losses['L_f'] = (torch.mean(heat_eq_norm ** 2) +
+                             torch.mean(mech_eq_x_norm ** 2) +
+                             torch.mean(mech_eq_y_norm ** 2))
+
+        # 3. 更稳定的λ调整 (0.5-0.6范围)
+        with torch.no_grad():
+            if 'L_u' in losses and 'L_f' in losses:
+                ratio = (losses['L_u'].detach() / (losses['L_f'].detach() + 1e-8))
+                ratio = torch.clamp(ratio, 0.5, 2.0)
+
+                # 更保守的λ调整
+                target_lambda = 0.55 * torch.pow(ratio, 0.3)  # 使用更小的指数
+                target_lambda = torch.clamp(target_lambda, 0.5, 0.6)
+
+                # 非常平滑的更新
+                current_lambda = torch.exp(self.log_lambda)
+                new_lambda = 0.995 * current_lambda + 0.005 * target_lambda
+                self.log_lambda.data = torch.log(torch.clamp(new_lambda, 0.5, 0.6))
+
+        phys_weight = torch.exp(self.log_lambda)
+
+        # 4. 总损失
+        total_loss = (losses.get('L_u', torch.tensor(0.0, device=self.device)) +
+                      phys_weight * losses.get('L_f', torch.tensor(0.0, device=self.device)))
+
+        # 更新损失历史
+        if targets is not None:
+            self.update_loss_history(total_loss)
+
+        return total_loss, losses, phys_weight.item()
+
+
+# ==================== 模型评估函数 ====================
+def evaluate_model(model, X_data, y_data, device):
+    """评估模型在给定数据集上的性能"""
+    model.eval()
+    with torch.no_grad():
+        X_data_device = X_data.to(device)
+        y_data_device = y_data.to(device)
+
+        pred = model(X_data_device)
+
+        # 计算各个输出分量的MSE
+        mse_u = torch.mean((pred[:, 0] - y_data_device[:, 0]) ** 2).item()
+        mse_v = torch.mean((pred[:, 1] - y_data_device[:, 1]) ** 2).item()
+        mse_T = torch.mean((pred[:, 2] - y_data_device[:, 2]) ** 2).item()
+
+        # 总体MSE
+        mse_total = torch.mean((pred - y_data_device) ** 2).item()
+
+        # 计算R²分数
+        def r2_score(y_true, y_pred):
+            ss_res = torch.sum((y_true - y_pred) ** 2)
+            ss_tot = torch.sum((y_true - torch.mean(y_true)) ** 2)
+            return 1 - ss_res / (ss_tot + 1e-8)
+
+        r2_u = r2_score(y_data_device[:, 0], pred[:, 0]).item()
+        r2_v = r2_score(y_data_device[:, 1], pred[:, 1]).item()
+        r2_T = r2_score(y_data_device[:, 2], pred[:, 2]).item()
+
+        results = {
+            'mse_total': mse_total,
+            'mse_u': mse_u, 'mse_v': mse_v, 'mse_T': mse_T,
+            'r2_u': r2_u, 'r2_v': r2_v, 'r2_T': r2_T,
+            'predictions': pred.cpu().numpy()
+        }
+
+    return results
+
+
+# ==================== 可视化函数 ====================
+def visualize_test_results(test_results, train_stats, output_dir):
+    """可视化测试结果"""
+    predictions = test_results['predictions']
+    y_test_norm = test_results['y_test_norm']
+
+    # 反标准化
+    pred_actual = denormalize_predictions(predictions, train_stats)
+    y_test_actual = denormalize_predictions(y_test_norm, train_stats)
+
+    component_names = ['u', 'v', 'T']
+    titles = ['位移u', '位移v', '温度T']
+
+    # 创建预测vs真实值散点图
+    plt.figure(figsize=(18, 6))
+    for i in range(3):
+        plt.subplot(1, 3, i + 1)
+        plt.scatter(y_test_actual[:, i], pred_actual[:, i], alpha=0.6, s=20)
+
+        # 添加对角线（理想情况）
+        min_val = min(y_test_actual[:, i].min(), pred_actual[:, i].min())
+        max_val = max(y_test_actual[:, i].max(), pred_actual[:, i].max())
+        plt.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
+
+        plt.xlabel(f'真实 {titles[i]}')
+        plt.ylabel(f'预测 {titles[i]}')
+        plt.title(f'{titles[i]} 预测 vs 真实\nMSE: {test_results[f"mse_{component_names[i]}"]:.3e}, '
+                  f'R²: {test_results[f"r2_{component_names[i]}"]:.3f}')
+        plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'test_prediction_scatter.png', dpi=800, bbox_inches='tight')
+    plt.close()
+
+    # 创建误差分布直方图
+    plt.figure(figsize=(18, 6))
+    for i in range(3):
+        plt.subplot(1, 3, i + 1)
+        errors = pred_actual[:, i] - y_test_actual[:, i]
+        mae = np.mean(np.abs(errors))
+        plt.hist(errors, bins=50, alpha=0.7, density=True, edgecolor='black')
+        plt.xlabel(f'{titles[i]} 误差')
+        plt.ylabel('密度')
+        plt.title(f'{titles[i]} 预测误差分布\nMAE: {mae:.3e}')
+        plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.savefig(output_dir / 'test_error_distribution.png', dpi=800, bbox_inches='tight')
+    plt.close()
+
+
+# ==================== 稳定训练流程 ====================
+def train():
+    # GPU设置
+    device = setup_gpu()
+
+    # 设置随机种子
+    torch.manual_seed(42)
+    np.random.seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed_all(42)
+
+    # 加载数据
+    print("正在加载数据...")
+    X_train, y_train, train_stats = load_and_normalize_data(train_path)
+    X_val, y_val, val_stats = load_and_normalize_data(val_path)
+
+    if X_train is None or X_val is None:
+        print("数据加载失败，请检查路径和文件格式！")
+        return
+
+    print(f"训练集大小: {X_train.shape[0]}, 验证集大小: {X_val.shape[0]}")
+
+    # 数据加载器
+    train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+
+    # 根据GPU内存调整批次大小
+    if device.type == 'cuda':
+        batch_size = 512  # GPU使用更大批次
+        num_workers = 4
+    else:
+        batch_size = 256  # CPU使用较小批次
+        num_workers = 0
+
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        drop_last=True, pin_memory=(device.type == 'cuda'),
+        num_workers=num_workers
+    )
+
+    # 模型
+    model = StablePhysicsInformedNN(device)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"模型参数总数: {total_params:,}")
+
+    # 更稳定的优化器配置
+    optimizer = torch.optim.AdamW([
+        {'params': [p for n, p in model.named_parameters() if 'log_lambda' not in n],
+         'lr': 1e-3, 'weight_decay': 1e-5, 'eps': 1e-8},  # 降低学习率
+        {'params': [model.log_lambda], 'lr': 5e-5, 'weight_decay': 0, 'eps': 1e-8}
+    ], amsgrad=True)  # 使用AMSGrad提高稳定性
+
+    # 更温和的学习率调度
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.8, patience=200,
+        threshold=1e-6, min_lr=1e-6, verbose=True
+    )
+
+    # 训练记录
+    history = {
+        'epoch': [], 'time': [], 'total_loss': [], 'train_loss': [], 'val_loss': [],
+        'L_u': [], 'L_f': [], 'L_u_u': [], 'L_u_v': [], 'L_u_T': [],
+        'phys_weight': [], 'lr': [], 'heat_scale': [], 'mech_scale': [],
+        'lambda_value': [], 'loss_stability': []
+    }
+
+    best_loss = float('inf')
+
+    print("开始训练...")
+    start_time = datetime.now()
+
+    try:
+        for epoch in range(10000):  # 固定训练10000轮
+            model.train()
+            epoch_loss = 0
+            train_loss = 0
+            batch_losses = []
+
+            for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
+                X_batch, y_batch = X_batch.to(device, non_blocking=True), y_batch.to(device, non_blocking=True)
+
+                optimizer.zero_grad()
+                total_loss, losses, phys_weight = model.compute_losses(X_batch, y_batch)
+
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"Epoch {epoch}, Batch {batch_idx}: 检测到异常损失，重新初始化")
+                    # 重新初始化模型参数
+                    model._initialize_weights()
+                    continue
+
+                total_loss.backward()
+
+                # 梯度裁剪
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+
+                optimizer.step()
+
+                epoch_loss += total_loss.item()
+                train_loss += losses.get('L_u', torch.tensor(0.0)).item()
+                batch_losses.append({k: v.item() if isinstance(v, torch.Tensor) else v
+                                     for k, v in losses.items()})
+
+                # GPU内存清理
+                if device.type == 'cuda' and batch_idx % 50 == 0:
+                    torch.cuda.empty_cache()
+
+            # 验证阶段
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val.to(device))
+                val_loss = torch.mean((val_pred - y_val.to(device)) ** 2).item()
+
+            # 学习率调度
+            scheduler.step(val_loss)
+
+            # 获取稳定性指标
+            stability = model.get_loss_stability()
+
+            # 模型保存（只保存最佳模型）
+            avg_total_loss = epoch_loss / len(train_loader)
+            if val_loss < best_loss:
+                best_loss = val_loss
+                torch.save({
+                    'model_state': model.state_dict(),
+                    'optimizer_state': optimizer.state_dict(),
+                    'scheduler_state': scheduler.state_dict(),
+                    'loss': best_loss,
+                    'stats': train_stats,
+                    'epoch': epoch
+                }, output_dir / "best_model.pth")
+
+            # 记录历史（每20轮记录一次）
+            if epoch % 20 == 0 or epoch == 9999:
+                if batch_losses:
+                    avg_batch_loss = {
+                        key: np.mean([l.get(key, 0) for l in batch_losses])
+                        for key in ['L_u', 'L_f', 'L_u_u', 'L_u_v', 'L_u_T']
+                    }
+
+                    history['epoch'].append(epoch)
+                    history['time'].append((datetime.now() - start_time).total_seconds())
+                    history['total_loss'].append(avg_total_loss)
+                    history['train_loss'].append(train_loss / len(train_loader))
+                    history['val_loss'].append(val_loss)
+                    history['L_u'].append(avg_batch_loss['L_u'])
+                    history['L_f'].append(avg_batch_loss['L_f'])
+                    history['L_u_u'].append(avg_batch_loss['L_u_u'])
+                    history['L_u_v'].append(avg_batch_loss['L_u_v'])
+                    history['L_u_T'].append(avg_batch_loss['L_u_T'])
+                    history['phys_weight'].append(phys_weight)
+                    history['lr'].append(optimizer.param_groups[0]['lr'])
+                    history['heat_scale'].append(model.thermo_norm.item())
+                    history['mech_scale'].append(model.mech_norm.item())
+                    history['lambda_value'].append(torch.exp(model.log_lambda).item())
+                    history['loss_stability'].append(stability)
+
+                    print(f"Epoch {epoch:4d} | Time: {history['time'][-1]:7.1f}s | "
+                          f"Total: {avg_total_loss:.3e} | Train: {history['train_loss'][-1]:.3e} | "
+                          f"Val: {val_loss:.3e} | L_u: {avg_batch_loss['L_u']:.3e} | "
+                          f"L_f: {avg_batch_loss['L_f']:.3e} | λ: {phys_weight:.3f} | "
+                          f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
+                          f"Stab: {stability:.3f}")
+
+            # 内存清理
+            if device.type == 'cuda' and epoch % 100 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+
+    except Exception as e:
+        print(f"训练出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+    # 最终模型保存
+    torch.save({
+        'model_state': model.state_dict(),
+        'optimizer_state': optimizer.state_dict(),
+        'scheduler_state': scheduler.state_dict(),
+        'loss': avg_total_loss,
+        'stats': train_stats,
+        'epoch': 9999  # 最后一轮
+    }, output_dir / "final_model.pth")
+
+    # ==================== 测试集评估 ====================
+    print("\n开始测试集评估...")
+    try:
+        # 加载测试集
+        X_test, y_test = load_test_data(test_path, train_stats)
+        if X_test is None:
+            print("测试集加载失败，跳过测试评估")
+        else:
+            print(f"测试集大小: {X_test.shape[0]}")
+
+            # 加载最佳模型
+            checkpoint = torch.load(output_dir / "best_model.pth")
+            model.load_state_dict(checkpoint['model_state'])
+
+            # 评估测试集
+            test_results = evaluate_model(model, X_test, y_test, device)
+            test_results['y_test_norm'] = y_test.cpu().numpy()
+
+            # 计算绝对误差
+            with torch.no_grad():
+                y_pred = model(X_test.to(device)).cpu().numpy()
+                y_true = y_test.cpu().numpy()
+
+                # 反标准化
+                y_pred_actual = denormalize_predictions(y_pred, train_stats)
+                y_true_actual = denormalize_predictions(y_true, train_stats)
+
+                # 计算各个组件的MAE
+                mae_u = np.mean(np.abs(y_pred_actual[:, 0] - y_true_actual[:, 0]))
+                mae_v = np.mean(np.abs(y_pred_actual[:, 1] - y_true_actual[:, 1]))
+                mae_T = np.mean(np.abs(y_pred_actual[:, 2] - y_true_actual[:, 2]))
+
+                # 打印测试结果
+                print("\n测试集评估结果:")
+                print(f"总体MSE: {test_results['mse_total']:.3e}")
+                print(f"位移u - MSE: {test_results['mse_u']:.3e}, R²: {test_results['r2_u']:.3f}, MAE: {mae_u:.3e}")
+                print(f"位移v - MSE: {test_results['mse_v']:.3e}, R²: {test_results['r2_v']:.3f}, MAE: {mae_v:.3e}")
+                print(f"温度T - MSE: {test_results['mse_T']:.3e}, R²: {test_results['r2_T']:.3f}, MAE: {mae_T:.3e}")
+
+                # 可视化测试结果
+                visualize_test_results(test_results, train_stats, output_dir)
+
+                # 保存测试结果
+                pd.DataFrame({
+                    'metric': ['mse_total', 'mse_u', 'mse_v', 'mse_T', 'r2_u', 'r2_v', 'r2_T', 'mae_u', 'mae_v',
+                               'mae_T'],
+                    'value': [
+                        test_results['mse_total'], test_results['mse_u'], test_results['mse_v'], test_results['mse_T'],
+                        test_results['r2_u'], test_results['r2_v'], test_results['r2_T'],
+                        mae_u, mae_v, mae_T
+                    ]
+                }).to_csv(output_dir / 'test_results.csv', index=False)
+
+    except Exception as e:
+        print(f"测试集评估出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+    # ==================== 可视化训练过程 ====================
+    if len(history['epoch']) > 0:
+        # 训练曲线图
+        plt.figure(figsize=(20, 15))
+
+        plt.subplot(3, 3, 1)
+        plt.semilogy(history['epoch'], history['total_loss'], label='Total Loss', linewidth=2)
+        plt.semilogy(history['epoch'], history['L_u'], '--', label='Data Loss (L_u)', linewidth=2)
+        plt.semilogy(history['epoch'], history['L_f'], '--', label='Physics Loss (L_f)', linewidth=2)
+        plt.axhline(1e-3, color='red', linestyle=':', label='Target (1e-3)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('训练进度')
+
+        plt.subplot(3, 3, 2)
+        plt.semilogy(history['epoch'], history['val_loss'], label='Validation Loss', color='orange', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Validation Loss')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('验证进度')
+
+        plt.subplot(3, 3, 3)
+        plt.plot(history['epoch'], history['lambda_value'], label='Physics Weight (λ)', color='green', linewidth=2)
+        plt.axhline(0.5, color='red', linestyle='--', alpha=0.7, label='λ范围 (0.5-0.6)')
+        plt.axhline(0.6, color='red', linestyle='--', alpha=0.7)
+        plt.fill_between(history['epoch'], 0.5, 0.6, alpha=0.1, color='red')
+        plt.xlabel('Epoch')
+        plt.ylabel('Physics Weight (λ)')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('物理权重演变')
+        plt.ylim(0.45, 0.65)
+
+        plt.subplot(3, 3, 4)
+        plt.semilogy(history['epoch'], history['lr'], label='Learning Rate', color='purple', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Learning Rate')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('学习率调度')
+
+        plt.subplot(3, 3, 5)
+        plt.plot(history['epoch'], history['loss_stability'], label='Loss Stability', color='brown', linewidth=2)
+        plt.axhline(0.1, color='red', linestyle=':', label='Stability Target (0.1)')
+        plt.xlabel('Epoch')
+        plt.ylabel('Coefficient of Variation')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('损失稳定性监控')
+
+        plt.subplot(3, 3, 6)
+        plt.semilogy(history['epoch'], history['L_u_u'], label='L_u (u)', linewidth=2)
+        plt.semilogy(history['epoch'], history['L_u_v'], label='L_u (v)', linewidth=2)
+        plt.semilogy(history['epoch'], history['L_u_T'], label='L_u (T)', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Component Losses')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('数据损失分量')
+
+        # 新增：训练损失 vs 验证损失对比图
+        plt.subplot(3, 3, 7)
+        plt.semilogy(history['epoch'], history['train_loss'], label='训练损失', color='blue', linewidth=3)
+        plt.semilogy(history['epoch'], history['val_loss'], label='验证损失', color='red', linewidth=3)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (log scale)')
+        plt.legend(fontsize=12)
+        plt.grid(True, alpha=0.3)
+        plt.title('训练损失 vs 验证损失', fontsize=14)
+
+        # 热力学和力学归一化尺度
+        plt.subplot(3, 3, 8)
+        plt.semilogy(history['epoch'], history['heat_scale'], label='Heat Scale', color='orange', linewidth=2)
+        plt.semilogy(history['epoch'], history['mech_scale'], label='Mech Scale', color='purple', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Normalization Scale')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.title('归一化尺度演变')
+
+        # 总体训练效果对比
+        plt.subplot(3, 3, 9)
+        plt.semilogy(history['epoch'], history['total_loss'], label='总损失', color='black', linewidth=3)
+        plt.semilogy(history['epoch'], history['train_loss'], label='训练损失', color='blue', linewidth=2)
+        plt.semilogy(history['epoch'], history['val_loss'], label='验证损失', color='red', linewidth=2)
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss (log scale)')
+        plt.legend(fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.title('总体训练效果')
+
+        plt.tight_layout()
+        plt.savefig(output_dir / 'training_results_10000_epochs.png', dpi=800, bbox_inches='tight')
+        plt.close()
+
+        # 单独的训练-验证损失对比图
+        plt.figure(figsize=(12, 8))
+        plt.semilogy(history['epoch'], history['train_loss'], label='训练损失', color='blue', linewidth=3)
+        plt.semilogy(history['epoch'], history['val_loss'], label='验证损失', color='red', linewidth=3)
+        plt.xlabel('Epoch', fontsize=14)
+        plt.ylabel('Loss (log scale)', fontsize=14)
+        plt.legend(fontsize=14)
+        plt.grid(True, alpha=0.3)
+        plt.title('训练损失 vs 验证损失', fontsize=16)
+        plt.tight_layout()
+        plt.savefig(output_dir / 'train_val_loss_comparison.png', dpi=800, bbox_inches='tight')
+        plt.close()
+
+        # 保存训练历史
+        pd.DataFrame(history).to_csv(output_dir / 'training_history_10000_epochs.csv', index=False)
+
+        print(f"\n训练完成！已完成全部10000轮训练")
+        print(f"最佳验证损失: {best_loss:.3e}")
+        print(f"最终总损失: {history['total_loss'][-1]:.3e}")
+        if history['L_u']:
+            print(f"最终L_u: {history['L_u'][-1]:.3e}, L_f: {history['L_f'][-1]:.3e}")
+            print(f"λ最终值: {history['lambda_value'][-1]:.3f} (范围: 0.5-0.6)")
+            print(f"最终稳定性: {history['loss_stability'][-1]:.3f}")
+        print(f"结果保存至: {output_dir}")
+        print(f"最佳模型保存为: best_model.pth")
+        print(f"最终模型保存为: final_model.pth")
+
+
+if __name__ == "__main__":
+    print("开始执行10000轮训练程序...")
+    train()
+    print("程序执行完毕")
